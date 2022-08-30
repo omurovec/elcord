@@ -48,6 +48,11 @@ See <https://discordapp.com/developers/applications/me>."
   :type 'integer
   :group 'elcord)
 
+(defcustom elcord-idle-disconnect-threshold 900
+  "How long until elcord should disconnect after idle, in seconds."
+  :type 'integer
+  :group 'elcord)
+
 (defcustom elcord-quiet 'nil
   "Whether or not to supress elcord messages (connecting, disconnecting, etc.)"
   :type 'boolean
@@ -147,6 +152,10 @@ has been started."
   :group 'elcord)
 
 (defvar elcord--startup-time (string-to-number (format-time-string "%s" (current-time))))
+
+(defvar elcord--last-active-time (string-to-number (format-time-string "%s" (current-time))))
+
+(defvar elcord--is-idle 'nil)
 
 (defcustom elcord-display-buffer-details 't
   "When enabled, Discord status will display buffer name and line numbers:
@@ -381,12 +390,11 @@ Argument EVNT The available output from the process."
   "Handles reconnecting when socket disconnects."
   (unless elcord-quiet
     (message "elcord: disconnected"))
-  ;;Stop updating presence for now
-  (elcord--cancel-updates)
   (setq elcord--sock nil)
-  ;;Start trying to reconnect
-  (when elcord-mode
-    (elcord--start-reconnect)))
+  ;;Start trying to reconnect if active
+  (when (and elcord-mode (not elcord--is-idle))
+    (progn (elcord--cancel-updates)
+      (elcord--start-reconnect))))
 
 (defun elcord--send-packet (opcode obj)
   "Packs and sends a packet to the IPC server.
@@ -565,6 +573,9 @@ If no text is available, use the value of `mode-name'."
           (setq cell (cdr cell)))))
     result))
 
+(defun elcord--update-last-active-time ()
+  (setq elcord--last-active-time (string-to-number (format-time-string "%s" (current-time)))))
+
 (defun elcord--try-update-presence (new-buffer-name new-buffer-position)
   "Try updating presence with `NEW-BUFFER-NAME' and `NEW-BUFFER-POSITION' while handling errors and disconnections."
   (setq elcord--last-known-buffer-name new-buffer-name
@@ -592,13 +603,30 @@ If there is no 'previous' buffer attempt to find a non-boring buffer to initiali
         (let ((new-buffer-position (count-lines (point-min) (point))))
           (unless (and (string= new-buffer-name elcord--last-known-buffer-name)
                        (= new-buffer-position elcord--last-known-position))
-            (elcord--try-update-presence new-buffer-name new-buffer-position)))))))
+            (progn (setq elcord--is-idle 'nil)
+                (unless elcord--sock (elcord--start-reconnect))
+                (elcord--try-update-presence new-buffer-name new-buffer-position)
+                (elcord--update-last-active-time)))))))
+
+  ;;Remove presence and disconnect if idle
+  (if (and (> (- (string-to-number (format-time-string "%s" (current-time))) elcord--last-active-time)
+            elcord-idle-disconnect-threshold)
+        elcord--sock)
+    (progn (setq elcord--is-idle 't)
+        ;;Cancel any reconnect attempt
+        (elcord--cancel-reconnect)
+        ;;If we're currently connected
+        (when elcord--sock
+        ;;Empty our presence
+        (elcord--empty-presence))
+        ;;Disconnect
+        (elcord--disconnect))))
 
 (defun elcord--start-updates ()
   "Start sending periodic update to Discord Rich Presence."
   (unless elcord--update-presence-timer
     (unless elcord-quiet
-      (message "elcord: connected. starting updates"))
+      (message "elcord: connected. starting updates TEST"))
     ;;Start sending updates now that we've heard from discord
     (setq elcord--last-known-position -1
           elcord--last-known-buffer-name ""
